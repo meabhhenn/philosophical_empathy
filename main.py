@@ -1,171 +1,201 @@
-"""main.py — open the philosophy collection and work with journal entries.
+"""main.py — a journaling companion backed by philosophy.
 
-The collection is built by readBook.py (the philosophical texts). This module
-adds personal journal entries alongside those book chunks, tagged so they can
-be queried on their own via where={"type": "journal"}.
+Flow for a new entry:
+  1. Ask gpt-4o-mini to name the feelings in the entry in one short sentence.
+  2. Show that sentence as "What I'm hearing:".
+  3. Search each philosopher with the FEELINGS sentence (not the raw entry).
+  4. Show matching passages as "<Philosopher> felt something like this too:"
+     with a one-line note on who they were (no distance labels).
+  5. Save the entry (plus its feelings sentence) in a separate "journal"
+     collection, kept apart from the "philosophy" collection of book chunks.
+
+The OpenAI key is loaded from a .env file via python-dotenv (OPENAI_API_KEY).
 """
 
 import datetime
+import os
 import time
 
 import chromadb
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()  # pull OPENAI_API_KEY (and anything else) out of .env
+
+AUTHORS = ["Marcus Aurelius", "Seneca", "Michel de Montaigne"]
+
+# One-line note on who each philosopher was, keyed by stored author value.
+AUTHOR_BIOS = {
+    "Marcus Aurelius": "a Roman emperor who wrote private Stoic notes to himself.",
+    "Seneca": "a Roman Stoic statesman, playwright, and letter-writer.",
+    "Michel de Montaigne": "a 16th-century French thinker who invented the essay.",
+}
+
+# Distance cutoffs (smaller = closer).
+MAX_DISTANCE = 1.55     # philosopher-passage match
+JOURNAL_DISTANCE = 1.3  # stricter cutoff for echoing a past journal entry
+
+CHAT_MODEL = "gpt-4o-mini"
 
 
+# --------------------------------------------------------------------------- #
+# collections
+# --------------------------------------------------------------------------- #
 def get_collection():
-    """Open the same persistent collection that readBook.py populates."""
+    """Open the philosophy collection that readBook.py populates."""
     client = chromadb.PersistentClient(path="chroma_db")
     return client.get_or_create_collection(name="philosophy")
 
 
-def add_journal_entry(collection, text):
-    """Save a journal entry to the collection.
+def get_journal_collection():
+    """Open (or create) the separate collection that holds journal entries."""
+    client = chromadb.PersistentClient(path="chroma_db")
+    return client.get_or_create_collection(name="journal")
 
-    Metadata is type="journal" plus today's date (YYYY-MM-DD). The id is based
-    on the current timestamp so each entry is unique.
 
-    Returns the id that was used.
+def add_journal_entry(journal, text, feelings=""):
+    """Save a journal entry to the journal collection.
+
+    Stores the entry text as the document, with metadata holding today's date
+    and the feelings sentence (so it can be shown later). The id is based on
+    the current timestamp so each entry is unique. Returns the id used.
     """
     entry_id = f"journal-{time.time_ns()}"  # nanosecond timestamp -> unique id
     today = datetime.date.today().isoformat()
-    collection.add(
+    journal.add(
         documents=[text],
         ids=[entry_id],
-        metadatas=[{"type": "journal", "date": today}],
+        metadatas=[{"type": "journal", "date": today, "feelings": feelings}],
     )
     return entry_id
 
 
-AUTHORS = ["Marcus Aurelius", "Seneca", "Michel de Montaigne"]
+# --------------------------------------------------------------------------- #
+# OpenAI: name the feelings
+# --------------------------------------------------------------------------- #
+def name_feelings(entry):
+    """Ask gpt-4o-mini for one short sentence naming the feelings in `entry`.
 
-# Distance thresholds (smaller distance = closer match).
-MAX_DISTANCE = 1.55    # above this, treat as "nothing to say"
-STRONG_DISTANCE = 1.45  # below this, label a match as "strong"
-JOURNAL_DISTANCE = 1.3  # stricter cutoff for the past-journal echo
-
-
-def reflect(collection, feeling):
-    """Find philosophical passages (and a past journal echo) for a feeling.
-
-    Searches the books one author at a time and the journal separately, prints
-    the relevant matches, then saves the feeling as a new journal entry (last,
-    so it can't match itself).
+    Returns the sentence, or None if the model couldn't be reached.
     """
-    # (1) one query per author, keep the single closest passage each.
-    matches = []
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("(No OPENAI_API_KEY found in .env — can't name feelings.)")
+        return None
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You read a journal entry and reply with ONE "
+                        "first-person sentence that describes, in plain "
+                        "everyday words, what the person is going through and "
+                        "the situation behind it. Do NOT use the words "
+                        "\"feeling\", \"feelings\", \"emotion\", or "
+                        "\"emotions\". Do NOT name specific people, places, or "
+                        "events; use general words instead (e.g. \"someone "
+                        "close to me\" rather than \"my sister\", or \"a "
+                        "setback\" rather than \"midterms\"). No advice, no "
+                        "preamble — just the sentence. "
+                        "Example: \"I feel cut off from the people I count on, "
+                        "right when everything is going wrong.\""
+                    ),
+                },
+                {"role": "user", "content": entry},
+            ],
+            temperature=0.3,
+            max_tokens=60,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as exc:  # network/auth/quota issues shouldn't crash the app
+        print(f"(Couldn't reach OpenAI: {exc})")
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# philosopher search
+# --------------------------------------------------------------------------- #
+def _print_author_match(collection, author, query, n_results=1):
+    """Query one author with `query`; print the closest in-cutoff passage.
+
+    Returns True if a passage was printed.
+    """
+    res = collection.query(
+        query_texts=[query],
+        n_results=n_results,
+        where={"author": author},
+    )
+    docs = res["documents"][0]
+    if not docs or res["distances"][0][0] > MAX_DISTANCE:
+        return False
+    work = res["metadatas"][0][0].get("work", "")
+    bio = AUTHOR_BIOS.get(author, "")
+    print(f"\n{author} felt something like this too:")
+    print(f"  ({author} was {bio})")
+    print(f"  {work}: {docs[0]}")
+    return True
+
+
+def reflect_on_entry(collection, journal, entry):
+    """Full journal flow: name feelings, search philosophers, save the entry."""
+    feelings = name_feelings(entry)
+    if not feelings:
+        # fall back to searching the raw entry if the model was unavailable
+        feelings = entry
+        print("\nWhat I'm hearing: (couldn't summarise — using your words)")
+    else:
+        print(f"\nWhat I'm hearing: {feelings}")
+
+    # Search all three philosophers with the feelings sentence, then show only
+    # the single closest passage overall (if it's under the cutoff).
+    best = None  # (distance, author, work, document)
     for author in AUTHORS:
         res = collection.query(
-            query_texts=[feeling],
+            query_texts=[feelings],
             n_results=1,
             where={"author": author},
         )
         docs = res["documents"][0]
         if not docs:
-            print(f"{author} doesn't have much to say about this")
             continue
         distance = res["distances"][0][0]
-        meta = res["metadatas"][0][0]
-        document = docs[0]
+        if best is None or distance < best[0]:
+            work = res["metadatas"][0][0].get("work", "")
+            best = (distance, author, work, docs[0])
 
-        # (2) drop anything too far away.
-        if distance > MAX_DISTANCE:
-            print(f"{author} doesn't have much to say about this")
-            continue
-        matches.append((distance, author, meta.get("work", ""), document))
-
-    # (3) print surviving passages, closest first, with a match-strength label.
-    if matches:
-        matches.sort(key=lambda m: m[0])
-        print()
-        for distance, author, work, document in matches:
-            label = "strong match" if distance < STRONG_DISTANCE else "loose match"
-            print(f"{author}, {work} ({label}):")
-            print(f"  {document}\n")
+    if best is not None and best[0] <= MAX_DISTANCE:
+        _, author, work, document = best
+        bio = AUTHOR_BIOS.get(author, "")
+        print(f"\n{author} felt something like this too:")
+        print(f"  ({author} was {bio})")
+        print(f"  {work}: {document}")
     else:
-        # (4) nothing cleared the threshold for any author.
-        print(
-            "\nNone of the philosophers seem to speak to this. "
-            "Try describing the feeling differently."
-        )
+        print("\nNone of the philosophers seem to speak to this today.")
 
-    # (5) look for a similar past journal entry.
-    print_journal_echo(collection, feeling)
-
-    # (6) finally, save this feeling as a new journal entry (after searching,
-    #     so it never matches itself above).
-    add_journal_entry(collection, feeling)
-
-
-def print_journal_echo(collection, feeling):
-    """Print the closest past journal entry if it's within the cutoff."""
-    journal = collection.query(
-        query_texts=[feeling],
+    # Before saving, look for a similar past journal entry (search by the
+    # feelings sentence). Done before the save so the new entry can't match
+    # itself.
+    past = journal.query(
+        query_texts=[feelings],
         n_results=1,
         where={"type": "journal"},
     )
-    journal_docs = journal["documents"][0]
-    if journal_docs and journal["distances"][0][0] < JOURNAL_DISTANCE:
-        distance = journal["distances"][0][0]
-        past_date = journal["metadatas"][0][0].get("date", "an earlier day")
-        # distance printed for tuning; remove once the cutoff feels right
-        print(f"You felt something similar on {past_date} "
-              f"(distance {distance:.3f}): {journal_docs[0]}")
+    past_docs = past["documents"][0]
+    if past_docs and past["distances"][0][0] < JOURNAL_DISTANCE:
+        past_date = past["metadatas"][0][0].get("date", "an earlier day")
+        print(f"\nYou wrote something similar on {past_date}: {past_docs[0]}")
+
+    # Save the entry with its feelings sentence in the journal collection.
+    add_journal_entry(journal, entry, feelings=feelings)
+    print("\nSaved to your journal.")
 
 
-def reflect_one(collection, author, feeling):
-    """Show one philosopher's best passages (top 2, same cutoff) for a feeling.
-
-    Prints the journal echo and saves the feeling as a new entry, like reflect.
-    """
-    res = collection.query(
-        query_texts=[feeling],
-        n_results=2,
-        where={"author": author},
-    )
-    docs = res["documents"][0]
-
-    # keep only the passages within the cutoff, closest first (query is already
-    # ordered by distance, but filter against MAX_DISTANCE).
-    matches = []
-    for i, document in enumerate(docs):
-        distance = res["distances"][0][i]
-        if distance > MAX_DISTANCE:
-            continue
-        work = res["metadatas"][0][i].get("work", "")
-        matches.append((distance, work, document))
-
-    if matches:
-        print()
-        for distance, work, document in matches:
-            label = "strong match" if distance < STRONG_DISTANCE else "loose match"
-            print(f"{author}, {work} ({label}):")
-            print(f"  {document}\n")
-    else:
-        print(f"\n{author} doesn't have much to say about this.")
-
-    print_journal_echo(collection, feeling)
-    add_journal_entry(collection, feeling)
-
-
-def view_journal(collection):
-    """Print all journal entries with their dates, oldest first."""
-    entries = collection.get(where={"type": "journal"})
-    docs = entries["documents"]
-    metas = entries["metadatas"]
-    if not docs:
-        print("\nYour journal is empty.")
-        return
-
-    # sort oldest first. The id carries a nanosecond timestamp, so fall back to
-    # it when two entries share a date.
-    rows = sorted(
-        zip(entries["ids"], metas, docs),
-        key=lambda r: (r[1].get("date", ""), r[0]),
-    )
-    print(f"\nYour journal ({len(rows)} entries):\n")
-    for _id, meta, document in rows:
-        print(f"[{meta.get('date', 'unknown date')}] {document}\n")
-
-
+# --------------------------------------------------------------------------- #
+# ask one philosopher
+# --------------------------------------------------------------------------- #
 # Menu display names mapped to the author value stored in the collection.
 PHILOSOPHERS = [
     ("Marcus Aurelius", "Marcus Aurelius"),
@@ -189,49 +219,73 @@ def ask_one_philosopher(collection):
     if not feeling:
         print("Nothing entered, returning to the menu.")
         return
-    reflect_one(collection, author, feeling)
+
+    if not _print_author_match(collection, author, feeling, n_results=2):
+        print(f"\n{author} doesn't have much to say about this.")
 
 
+# --------------------------------------------------------------------------- #
+# view journal
+# --------------------------------------------------------------------------- #
+def view_journal(journal):
+    """Print all journal entries with their dates, oldest first."""
+    entries = journal.get(where={"type": "journal"})
+    docs = entries["documents"]
+    if not docs:
+        print("\nYour journal is empty.")
+        return
+
+    # oldest first; id carries a nanosecond timestamp as a tiebreaker on date.
+    rows = sorted(
+        zip(entries["ids"], entries["metadatas"], docs),
+        key=lambda r: (r[1].get("date", ""), r[0]),
+    )
+    print(f"\nYour journal ({len(rows)} entries):\n")
+    for _id, meta, document in rows:
+        print(f"[{meta.get('date', 'unknown date')}] {document}")
+        feelings = meta.get("feelings")
+        if feelings and feelings != document:
+            print(f"    feelings: {feelings}")
+        print()
+
+
+# --------------------------------------------------------------------------- #
+# menu
+# --------------------------------------------------------------------------- #
 MENU = """
 What would you like to do?
-  1. Tell me how you feel
+  1. Write a journal entry
   2. Ask one philosopher
-  3. Write a journal entry
-  4. View my journal
-  5. Quit
+  3. View my journal
+  4. Quit
 """
 
 
 def main():
     collection = get_collection()
-    print(f"Philosophy collection holds {collection.count()} stored items.")
+    journal = get_journal_collection()
+    print(f"Philosophy collection holds {collection.count()} passages; "
+          f"your journal holds {journal.count()} entries.")
 
     while True:
         print(MENU)
         choice = input("Choose a number: ").strip()
 
         if choice == "1":
-            feeling = input("How do you feel? ").strip()
-            if not feeling:
+            entry = input("Write your journal entry: ").strip()
+            if not entry:
                 print("Nothing entered, returning to the menu.")
                 continue
-            reflect(collection, feeling)
+            reflect_on_entry(collection, journal, entry)
         elif choice == "2":
             ask_one_philosopher(collection)
         elif choice == "3":
-            text = input("Write your journal entry: ").strip()
-            if not text:
-                print("Nothing entered, returning to the menu.")
-                continue
-            add_journal_entry(collection, text)
-            print("Saved.")
+            view_journal(journal)
         elif choice == "4":
-            view_journal(collection)
-        elif choice == "5":
             print("Take care.")
             break
         else:
-            print("Please choose a number from 1 to 5.")
+            print("Please choose a number from 1 to 4.")
 
 
 if __name__ == "__main__":
