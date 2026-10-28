@@ -1,0 +1,10 @@
+Idea: type a feeling, get passages from Marcus Aurelius, Seneca, Montaigne about it.
+Books: Meditations, Minor Dialogues (Seneca), Essays Book 1 (Montaigne)
+One item = one paragraph from a book (max 150 words), or one journal entry.
+What the app does with results: explains them in plain English + connects to my journal.
+
+Query 1: "I just failed all my midterms this week and my sister won't pick up my calls"
+  Should find: passage about setbacks / loneliness / lack of support
+Query 2: "We're celebrating my sister's birthday tomorrow, she's so amazing and caring"
+  Should find: Marcus Book 1 gratitude list / appreciating others
+Why keywords fail: old books never say "midterms", "sister", "calls", "birthday"
